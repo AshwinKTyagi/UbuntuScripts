@@ -163,7 +163,29 @@ class Pipeline:
             streaming=True,
         )
 
-        try: 
+        try:
             response = query_engine.query(user_message)
-            sql_query = self.extract
-        return response.response_gen
+            sql_query = self.extract_sql_query(response.metadata)
+
+            # Check if the response is a streaming response and handle it accordingly
+            if hasattr(response, "response_gen"):
+                final_response = self.handle_streaming_response(response.response_gen)
+                result = f"Generated SQL Query: \n```sql\n{sql_query}\n```\nResult: {final_response}"
+                return result
+            else:
+                final_response = response.response
+                result = f"Generated SQL Query: \n```sql\n{sql_query}\n```\nResult: {final_response}"
+                return result
+            
+        except aiohttp.ClientResponseError as e:
+            logging.error(f"ClientResponseError: {e}")
+            return f"ClientResponseError: {e}"
+        except aiohttp.ClientPayloadError as e:
+            logging.error(f"ClientPayloadError: {e}")
+            return f"ClientPayloadError: {e}"        
+        except aiohttp.ClientConnectionError as e:
+            logging.error(f"ClinetConnectionError: {e}")
+            return f"ClientConnectionError: {e}"
+        except Exception as e:
+            logging.error(f"Error: {e}")
+            return f"Error: {e}"
