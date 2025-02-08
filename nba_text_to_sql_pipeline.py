@@ -5,10 +5,11 @@ date: 2025-02-03
 version: 1.1
 license: MIT
 description: This pipeline is used to query an NBA database using natural language questions and generate SQL queries to retrieve the answers.
-requirements: open-webui, pydantic, sqlalchemy, llama_index, psycopg2-binary
 """
+# requirements: open-webui, pydantic, sqlalchemy, llama_index, psycopg2-binary
 
 import asyncio, aiohttp
+import re
 from pydantic import BaseModel
 from typing import List, Union, Generator, Iterator
 import os
@@ -86,14 +87,22 @@ class Pipeline:
                 await asyncio.sleep(2 ** attempt)
 
 
-    def extract_sql_query(self, response):
+    def extract_sql(self, response):
         # Extract the SQL query from the response
+        if self.debug:
+            print(response)
         for key,value in response.items():
             if isinstance(value, dict) and "sql_query" in value:
                 return value["sql_query"]
             elif key == "sql_query":
                 return value
         return None
+    
+    # def extract_sql(self, response_text):
+    #     # Extract the SQL query from the response
+    #     match = re.search(r"SELECT .*", response_text, re.DOTALL | re.IGNORECASE)
+    #     return match.group(0).strip() if match else response_text.strip()
+
     
     def handle_streaming_response(self, response):
         final_response = ""
@@ -106,11 +115,11 @@ class Pipeline:
         # Emit a status update to show that pipe is connecting to the database
         print(f"pipe:{__name__}")
         
-        print(messages)
-        print(user_message)
-
         if self.debug:
             print(f"pipe: {__name__} - received message from user: {user_message}")
+
+            print(messages)
+            print(user_message)
 
         # Create a database engine
         sql_db = SQLDatabase(self.engine, include_tables=self.valves.DB_TABLES)
@@ -124,33 +133,54 @@ class Pipeline:
         )
 
         #set up custom prompt template for generating SQL queries from text
+            #system header: provides instructions on how the AI should behave
+            #user header: contains the natural language query
+            #assistant: can provide an example SQL output if needed
+
+
+        # text to sql prompt will be used to generate SQL queries from text
         text_to_sql_prompt = '''
-        <|begin_of_text|><|start_header_id|>system<|end_header_id|>    
         You are a helpful AI Assistant providing PostgreSQL commands to users.
-        Make sure to always use the stop token you were trained on at the end of a response: <|eot_id|>
-        
+        Make sure to always use the stop token you were trained on at the end of a response: <|eot_id|>         
         Given an input question, create a syntactically correct PostgreSQL query to run.
         You can order the results by a relevant column to return the most interesting examples in the database.
-        Unless the user specifies in the question a specific number of examples to obtain, query for at most 5 results using the LIMIT clause as per Postgres.
         Never query for all the columns from a specific table, only ask for a few relevant columns given the question.
-        You should use DISTINCT statements and avoid returning duplicates wherever possible.
-        Pay attention to use only the column names that you can see in the schema description. Be careful to not query for columns that do not exist. Pay attention to which column is in which table. Also, qualify column names with the table name when needed. 
-        
-        
-        Please include all of the following in your response:
-        - The original question
-        - The SQL query to run
-        - The raw result from the SQL execution
-        - A final, human-friendly answer to the question    
+        Only refer to the player table when asked if a player is actively playing. Otherwise, refer to the common_player_info table
+        If a team is mentioned in the question, search the team table for the nickname in the nickname to get the team_id
+        The common_player_info table connects to the team table on team_id and the player table on person_id
+        The player table's is_active column has a value of 1 if the player is actively playing and 0 if they are not
+        Only return the SQL query. Do not include any explanation, additional text, or formatting. 
 
-        Here is the schema of the database:
+        <|start_header_id|>user<|end_header_id|>
+        Question: Who are the active players are on the Kings? <|eot_id|>
+
+        SQLQuery: SELECT p.full_name FROM common_player_info AS cpi, player AS p, team AS t WHERE cpi.team_id = t.id AND cpi.person_id = p.id AND t.nickname = 'Kings' AND p.is_active = 1; <|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+        <|start_header_id|>user<|end_header_id|>
+
+        Here is the database schema:
         {schema}
 
-        question: {query_str}
+        Question: {query_str} <|eot_id|> <|start_header_id|>assistant<|end_header_id|>
         SQLQuery:
         '''
         
+        # generate human-readable responses from SQL queries
+        synthesis_prompt = '''
+        <|begin_of_text|><|start_header_id|>system<|end_header_id|>    
+        You are an AI assistant that summarizes database query results in a user-friendly format.
+
+        Given the SQL query result below, generate a human-readable response:
+            
+        Query Result:
+        {query_result}
+
+        Ensure the response is concise, formatted, and easy to understand.
+        <|eot_id|>
+        '''
+
         text_to_sql_template = PromptTemplate(text_to_sql_prompt)
+        synthesis_prompt_template = PromptTemplate(synthesis_prompt)
 
         #set up the query engine
         query_engine = NLSQLTableQueryEngine(
@@ -159,22 +189,33 @@ class Pipeline:
             llm=llm,
             text_to_sql_prompt=text_to_sql_template,
             embed_model="local",
-            synthesize_response=False,
+            synthesize_response=True,
+            synthesis_prompt=synthesis_prompt_template,
             streaming=True,
         )
 
         try:
             response = query_engine.query(user_message)
-            sql_query = self.extract_sql_query(response.metadata)
+            sql_query = self.extract_sql(response.metadata)
 
             # Check if the response is a streaming response and handle it accordingly
             if hasattr(response, "response_gen"):
                 final_response = self.handle_streaming_response(response.response_gen)
-                result = f"Generated SQL Query: \n```sql\n{sql_query}\n```\nResult: {final_response}"
+
+                if self.debug:
+                    print("\nSQL:\n", sql_query)
+                    print("\nFinal\n", final_response)
+
+                result = f"Generated SQL Query: \n ```sql\n{sql_query}\n``` \n {final_response}"
                 return result
             else:
                 final_response = response.response
-                result = f"Generated SQL Query: \n```sql\n{sql_query}\n```\nResult: {final_response}"
+
+                if self.debug:
+                    print("\nSQL:\n", sql_query)
+                    print("\nFinal\n", final_response)
+
+                result = f"Generated SQL Query: \n```sql\n{sql_query}\n``` {final_response}"
                 return result
             
         except aiohttp.ClientResponseError as e:
