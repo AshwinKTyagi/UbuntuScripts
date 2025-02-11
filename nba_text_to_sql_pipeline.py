@@ -34,6 +34,7 @@ class Pipeline:
         OLLAMA_HOST: str
         TEXT_TO_SQL_MODEL: str
         CONTEXT_WINDOW: int = 4096
+        TIMEOUT: float = 300.0
 
     def __init__(self):
         self.name = "SQL Query on NBA Database"
@@ -52,8 +53,9 @@ class Pipeline:
                 "DB_DATABASE": os.getenv("PG_DB", "nba_db"),
                 "DB_TABLES": ["*"],
                 "OLLAMA_HOST": os.getenv("OLLAMA_HOST", "http://host.docker.internal:11435"),
-                "TEXT_TO_SQL_MODEL": "mistral",
-                "CONTEXT_WINDOW": 4096
+                "TEXT_TO_SQL_MODEL": "llama3.1",
+                "CONTEXT_WINDOW": 4096,
+                "TIMEOUT": 300.0,
             }
         )
 
@@ -128,7 +130,7 @@ class Pipeline:
         llm = Ollama(
             model=self.valves.TEXT_TO_SQL_MODEL,
             base_url=self.valves.OLLAMA_HOST,
-            request_timeout=300.0,
+            request_timeout=self.valves.TIMEOUT,
             context_window=self.valves.CONTEXT_WINDOW,
         )
 
@@ -143,19 +145,53 @@ class Pipeline:
         You are a helpful AI Assistant providing PostgreSQL commands to users.
         Make sure to always use the stop token you were trained on at the end of a response: <|eot_id|>         
         Given an input question, create a syntactically correct PostgreSQL query to run.
-        You can order the results by a relevant column to return the most interesting examples in the database.
+        Use window functions to rank or aggregate data when necessary.
         Never query for all the columns from a specific table, only ask for a few relevant columns given the question.
         Only refer to the player table when asked if a player is actively playing. Otherwise, refer to the common_player_info table
         If a team is mentioned in the question, search the team table for the nickname in the nickname to get the team_id
         The common_player_info table connects to the team table on team_id and the player table on person_id
         The player table's is_active column has a value of 1 if the player is actively playing and 0 if they are not
+        Assume questions will ask for active players only unless otherwise specified.
+        Do not use the id fields when returning the result, instead use their full_name or nickname so that the user can understand them
+        If the question is related to height, cast the height column to its integer representation in inches since it is originally stored in a text field as '6-10'.
         Only return the SQL query. Do not include any explanation, additional text, or formatting. 
 
         <|start_header_id|>user<|end_header_id|>
         Question: Who are the active players are on the Kings? <|eot_id|>
 
-        SQLQuery: SELECT p.full_name FROM common_player_info AS cpi, player AS p, team AS t WHERE cpi.team_id = t.id AND cpi.person_id = p.id AND t.nickname = 'Kings' AND p.is_active = 1; <|eot_id|><|start_header_id|>assistant<|end_header_id|>
+        SQLQuery: 
+        SELECT p.full_name 
+        FROM common_player_info AS cpi, player AS p, team AS t 
+        WHERE cpi.team_id = t.id 
+            AND cpi.person_id = p.id 
+            AND t.nickname = 'Kings' 
+            AND p.is_active = 1; <|eot_id|><|start_header_id|>assistant<|end_header_id|>
 
+        <|start_header_id|>user<|end_header_id|>
+        Question: Who is the tallest player from every team? <|eot_id|>
+
+        SQLQuery: 
+        WITH RankedPlayers AS (
+        SELECT
+            t.full_name AS team_name,
+            p.full_name AS player_name,
+            c.height,
+            ROW_NUMBER() OVER 
+                (PARTITION BY t.id 
+                ORDER BY 
+                (CAST(split_part(c.height, '-', 1) AS INTEGER) * 12 +
+                CAST(split_part(c.height, '-', 2) AS INTEGER)) DESC) AS rn
+        FROM team AS t
+        JOIN common_player_info AS c ON t.id = c.team_id
+        JOIN player as p ON c.person_id = p.id
+        WHERE p.is_active = 1
+        )
+        SELECT
+            rp.team_name,
+            rp.player_name,
+            rp.height
+        FROM RankedPlayers AS rp
+        WHERE rp.rn = 1;
         <|start_header_id|>user<|end_header_id|>
 
         Here is the database schema:
@@ -169,8 +205,9 @@ class Pipeline:
         synthesis_prompt = '''
         <|begin_of_text|><|start_header_id|>system<|end_header_id|>    
         You are an AI assistant that summarizes database query results in a user-friendly format.
+        Ensure the units used for weight and height make sense.
 
-        Given the SQL query result below, generate a human-readable response:
+        Given the SQL query result below, give a table of the results and generate a human-readable response:
             
         Query Result:
         {query_result}
